@@ -15,6 +15,13 @@ import sys
 from multiprocessing import Process, Queue
 import workers # define the worker functions in this .py file
 import warnings
+from heading_corrector import (
+    HeadingCorrector,
+    parse_sensor_names,
+    quat_mul,
+    quat_inv,
+    quat_log,
+)
 
 def clear(q):
     try:
@@ -43,6 +50,13 @@ constraint_var = 10.0
 sim_len = 600.0 # max time in seconds to collect data before requiring re-intialization
 kin_store_size = sim_len + 10.0 
 init_time = 3.0 # seconds of data to initialize from
+heading_update_hz = 10.0
+pelvis_heading_gain = 0.02
+leg_heading_gain = 0.08
+heading_yaw_limit = np.deg2rad(20.0)
+heading_yaw_outlier = np.deg2rad(35.0)
+heading_stance_gyro_thresh = np.deg2rad(40.0)
+heading_use_bias = False
 if log_temp:
     from gpiozero import CPUTemperature
     cpu = CPUTemperature()
@@ -124,6 +138,20 @@ while(script_live):
         model.getVisualizer().show(s0)
         model.getVisualizer().getSimbodyVisualizer().setShowSimTime(True)
 
+    sensor_names = parse_sensor_names(header_text)
+    heading_corrector = HeadingCorrector(
+        sensor_names=sensor_names,
+        model=model,
+        rate=rate,
+        update_hz=heading_update_hz,
+        pelvis_gain=pelvis_heading_gain,
+        leg_gain=leg_heading_gain,
+        yaw_limit=heading_yaw_limit,
+        yaw_outlier=heading_yaw_outlier,
+        stance_gyro_thresh=heading_stance_gyro_thresh,
+        use_bias=heading_use_bias,
+    )
+
     # IK solver loop
     t = 0 # number of steps
     st = 0. # timing simulation
@@ -157,7 +185,8 @@ while(script_live):
         time_stamp, Qi = q.get()
         add_time = time.time()
         time_s = t*dt
-        quat2sto_single(Qi, header_text, sto_filename, time_s, rate, sensor_ind_list) # store next line of fake online data to one-line STO
+        Qi_corr = heading_corrector.apply(Qi)
+        quat2sto_single(Qi_corr, header_text, sto_filename, time_s, rate, sensor_ind_list) # store next line of fake online data to one-line STO
         
         # IK
         quatTable = osim.TimeSeriesTableQuaternion(sto_filename)
@@ -172,7 +201,33 @@ while(script_live):
             ikProc1.start()
             ik_list.append(ikProc1)
         else:
-            ikSolver.track(s0)
+            ik_success = True
+            try:
+                ikSolver.track(s0)
+            except Exception:
+                ik_success = False
+
+        if not parallelize and ik_success:
+            q_model = heading_corrector.compute_model_quats(model, s0)
+            residual_metric = None
+            e_yaw_all = []
+            for name, idx in heading_corrector.sensor_indices.items():
+                if name not in q_model:
+                    continue
+                q_err = quat_mul(q_model[name], quat_inv(Qi_corr[idx]))
+                e_vec = quat_log(q_err)
+                e_yaw_all.append(float(np.dot(e_vec, np.array([0.0, 1.0, 0.0]))))
+            if e_yaw_all:
+                residual_metric = float(np.median(np.abs(e_yaw_all)))
+            heading_corrector.update(
+                Qi,
+                Qi_corr,
+                q_model,
+                time_s,
+                dt,
+                ik_success=ik_success,
+                residual_metric=residual_metric,
+            )
 
         while(ik.qsize() > 0):
             time_vec[p_cnt,1] = ik.get()[0]
